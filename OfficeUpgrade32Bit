@@ -1,0 +1,97 @@
+#Gets creds
+$creds = Get-AutomationPSCredential -Name "PSRemote"
+
+# Connect to Azure with system-assigned managed identity
+$AzureContext = (Connect-AzAccount -Identity).context
+
+# Get all VMs with a specific tag
+$vms = Get-AzVM | Where-Object {$_.Tags.Keys -contains "UpdateOffice"}
+
+# Loop through each VM
+foreach ($vm in $vms) {
+try {
+$session = New-PSSession -ComputerName $vms.Name -Credential $creds
+} catch {
+Write-Error "Error connecting to the VM: $_"
+}
+#Create the ODT Directory if it doesn't exist
+Invoke-Command -Session $session -ScriptBlock {
+if (!(Test-Path -Path "C:\ODT")) {
+New-Item -ItemType Directory -Path "C:\ODT"
+}
+}
+#Create the Office Logs directory if it doesn't exist.
+Invoke-Command -Session $session -ScriptBlock {
+if (!(Test-Path -Path "C:\OfficeLogs")) {
+New-Item -ItemType Directory -Path "C:\OfficeLogs"
+}
+}
+#Get the current Office version and log it in the directory.
+Invoke-Command -Session $session -ScriptBlock {
+$currentVersion = (Get-ItemProperty HKLM:\Software\Microsoft\Office\ClickToRun\Configuration).VersionToReport
+Add-Content -Path "C:\OfficeLogs\OfficeVersionLog.txt" -Value "Current Office version: $currentVersion"
+}
+
+# Download the Office Deployment Tool
+Invoke-Command -Session $session -ScriptBlock {
+Invoke-WebRequest -Uri "https://download.microsoft.com/download/2/7/A/27AF1BE6-DD20-4CB4-B154-EBAB8A7D4A7E/officedeploymenttool_15928-20216.exe" -OutFile "C:\ODT\ODT.exe"
+}
+# Create the XML configuration file
+$XML = @"
+    <Configuration ID="3ba0d03f-7424-4834-8823-e91fb0a97444">
+<Add OfficeClientEdition="32" Channel="SemiAnnual">
+<Product ID="O365ProPlusRetail">
+<Language ID="MatchOS"/>
+<ExcludeApp ID="Groove"/>
+<ExcludeApp ID="Lync"/>
+<ExcludeApp ID="OneDrive"/>
+<ExcludeApp ID="OneNote"/>
+<ExcludeApp ID="Bing"/>
+</Product>
+</Add>
+<Property Name="SharedComputerLicensing" Value="1"/>
+<Property Name="FORCEAPPSHUTDOWN" Value="FALSE"/>
+<Property Name="DeviceBasedLicensing" Value="0"/>
+<Property Name="SCLCacheOverride" Value="0"/>
+<Updates Enabled="TRUE"/>
+<Display Level="Full" AcceptEULA="TRUE"/>
+</Configuration>
+"@
+
+# Save the XML configuration file
+Invoke-Command -Session $session -ScriptBlock {
+Set-Content -Path "C:\ODT\EXGconfiguration.xml" -Value $using:XML
+}
+# Run the ODT Tool
+Invoke-Command -Session $session -ScriptBlock {
+Start-Process -FilePath "C:\ODT\ODT.exe" -ArgumentList '/extract:C:\ODT', '/passive', '/quiet' -Wait
+}
+
+#Wait for 120 seconds
+Start-Sleep -Seconds 10
+
+#Download the relevant Office Files
+Invoke-Command -Session $session -ScriptBlock {
+cd C:\ODT
+C:\ODT\setup.exe /download C:\ODT\EXGconfiguration.xml 
+}
+
+#Configure the Office Update
+Invoke-Command -Session $session -ScriptBlock {
+cd C:\ODT
+c:\ODT\setup.exe /Configure C:\ODT\EXGconfiguration.xml
+}
+#Log the version Office was updated to
+Invoke-Command -Session $session -ScriptBlock {
+$updatedVersion = (Get-ItemProperty HKLM:\Software\Microsoft\Office\ClickToRun\Configuration).VersionToReport
+Add-Content -Path "C:\OfficeLogs\OfficeVersionLog.txt" -Value "Updated Office version: $updatedVersion"
+}
+
+Invoke-Command -Session $session -ScriptBlock {
+Remove-Item -Path "C:\ODT\*" -Recurse -Force
+}
+#It's worth noting that the use of '-Force' parameter will delete the items without asking for confirmation. If you'd like to be prompted before deleting the files, you can remove '-Force' from the command.
+
+# Disconnect from the VM
+Remove-PSSession -Session $session
+}
